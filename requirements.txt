@@ -1,0 +1,12 @@
+# Use the same Pyrogram fork as your other bots (pyrotgfork), which installs as `pyrogram`
+pyrotgfork
+tgcrypto
+motor
+aiohttp
+beautifulsoup4
+python-dotenv
+libtorrent
+# libtorrent's Python bindings are usually easiest via your OS package manager:
+#   sudo apt install python3-libtorrent
+# then symlink/copy it into your venv's site-packages if the venv can't see the system one.
+# pip install works on some platforms too: pip install libtorrent
