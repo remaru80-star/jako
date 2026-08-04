@@ -5,6 +5,7 @@ import shutil
 import time
 
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 import config
@@ -68,6 +69,62 @@ def _progress_bar(fraction: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+# Minimum real time between status message edits. Telegram will flood-wait an
+# account that edits the same message too often, and — critically — pyrogram
+# awaits the progress callback for every chunk sent/received during a
+# download or upload. If that callback blocks on a slow or flood-limited
+# edit_text() call, the actual transfer stalls right along with it, which is
+# what caused uploads to look "stuck" near completion while the last-shown
+# speed still looked healthy (it reflected the last chunk that got through,
+# not the time spent blocked afterwards).
+_EDIT_INTERVAL = 8  # seconds
+
+
+def _new_edit_gate() -> dict:
+    return {"time": 0.0, "percent": -1, "bytes": 0, "busy": False, "cooldown_until": 0.0}
+
+
+def _schedule_edit(gate: dict, msg: Message, text: str):
+    """Fire a status edit in the background instead of awaiting it inline.
+
+    Only one edit per gate is ever in flight, and a FloodWait pauses further
+    edits until it expires instead of letting pyrogram's automatic retry
+    block whatever coroutine happens to be awaiting this callback.
+    """
+    now = time.time()
+    if gate["busy"] or now < gate["cooldown_until"]:
+        return
+    gate["busy"] = True
+
+    async def _run():
+        try:
+            await msg.edit_text(text)
+        except FloodWait as e:
+            gate["cooldown_until"] = time.time() + e.value
+        except Exception as e:
+            logger.warning("Status edit failed: %s", e)
+        finally:
+            gate["busy"] = False
+
+    asyncio.create_task(_run())
+
+
+async def _safe_edit(msg: Message, text: str):
+    """For the handful of one-off status edits (not per-chunk progress) that
+    we do want to actually happen — retries once after a flood wait instead
+    of losing the update or crashing the whole item."""
+    try:
+        await msg.edit_text(text)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        try:
+            await msg.edit_text(text)
+        except Exception as e2:
+            logger.warning("Status edit failed after flood wait: %s", e2)
+    except Exception as e:
+        logger.warning("Status edit failed: %s", e)
+
+
 async def _process_one(client: Client, message: Message, nyaa_id: str):
     try:
         html = await nyaa_client.fetch_page(nyaa_id)
@@ -122,25 +179,20 @@ async def _process_one(client: Client, message: Message, nyaa_id: str):
     )
     status_msg = await client.send_message(backup_channel_id, f"{title_line}\n\nQueued for download...")
 
-    # Throttle edits so we don't hit Telegram's rate limit on fast-updating torrents.
-    # "busy" ensures only one edit_text() is ever in flight at a time — libtorrent
-    # fires a new progress tick every ~2s regardless of whether the previous edit
-    # has finished, and if we let those pile up while Telegram is flood-waiting one
-    # of them, several concurrent retries stack up on the same connection and can
-    # take minutes to fully drain (this is what caused the "stuck after 100%" hang).
-    last_edit = {"time": 0.0, "percent": -1, "busy": False}
+    last_edit = _new_edit_gate()
 
     async def on_progress(status: dict):
-        if last_edit["busy"]:
-            return
         now = time.time()
         percent = int(status["progress"] * 100)
         if status["stage"] == "metadata":
-            text = f"{title_line}\n\nFetching torrent metadata..."
-            if now - last_edit["time"] < 5:
+            if now - last_edit["time"] < _EDIT_INTERVAL:
                 return
+            text = f"{title_line}\n\nFetching torrent metadata..."
         else:
-            if percent == last_edit["percent"] and now - last_edit["time"] < 5:
+            # Purely time-gated (not "same percent" gated) — on a fast download
+            # the percent changes on nearly every tick, and gating on percent
+            # alone let edits through far more often than intended.
+            if percent == last_edit["percent"] or now - last_edit["time"] < _EDIT_INTERVAL:
                 return
             bar = _progress_bar(status["progress"])
             speed = _format_bytes(status["download_rate"]) + "/s"
@@ -152,13 +204,7 @@ async def _process_one(client: Client, message: Message, nyaa_id: str):
             )
         last_edit["time"] = now
         last_edit["percent"] = percent
-        last_edit["busy"] = True
-        try:
-            await status_msg.edit_text(text)
-        except Exception as e:
-            logger.warning("Download status edit failed at %d%%: %s", percent, e)
-        finally:
-            last_edit["busy"] = False
+        _schedule_edit(last_edit, status_msg, text)
 
     file_path = None
     try:
@@ -172,36 +218,33 @@ async def _process_one(client: Client, message: Message, nyaa_id: str):
         # fires once a variant is fully finished). Without this edit, the message
         # is left showing the last "Downloading: 100% · 0.0 B/s" line the whole
         # time it's encoding, which looks identical to a hung download.
-        await status_msg.edit_text(f"{title_line}\n\nDownload complete. Starting encode...")
+        await _safe_edit(status_msg, f"{title_line}\n\nDownload complete. Starting encode...")
 
         dest_dir = os.path.join(config.DOWNLOAD_DIR, nyaa_id)
         last_message_link = None
 
         async def on_variant_start(label: str):
-            await status_msg.edit_text(f"{title_line}\n\nEncoding {label}...")
+            await _safe_edit(status_msg, f"{title_line}\n\nEncoding {label}...")
 
         async def on_variant_done(label: str, encoded_path: str):
             nonlocal last_message_link
-            await status_msg.edit_text(f"{title_line}\n\nEncoded {label}. Uploading...")
+            await _safe_edit(status_msg, f"{title_line}\n\nEncoded {label}. Uploading...")
 
-            upload_last_edit = {"time": 0.0, "percent": -1, "bytes": 0, "busy": False}
+            upload_last_edit = _new_edit_gate()
 
             async def on_upload_progress(current: int, total: int):
-                if upload_last_edit["busy"]:
-                    return
                 now = time.time()
                 percent = int(current / total * 100) if total else 0
-                if percent == upload_last_edit["percent"] and now - upload_last_edit["time"] < 5:
+                if percent == upload_last_edit["percent"] or now - upload_last_edit["time"] < _EDIT_INTERVAL:
                     return
 
-                elapsed = now - upload_last_edit["time"]
+                elapsed = now - upload_last_edit["time"] if upload_last_edit["time"] else 0
                 byte_delta = current - upload_last_edit["bytes"]
-                speed = byte_delta / elapsed if elapsed > 0 and upload_last_edit["time"] else 0
+                speed = byte_delta / elapsed if elapsed > 0 else 0
 
                 upload_last_edit["time"] = now
                 upload_last_edit["percent"] = percent
                 upload_last_edit["bytes"] = current
-                upload_last_edit["busy"] = True
 
                 bar = _progress_bar(current / total if total else 0)
                 text = (
@@ -209,19 +252,27 @@ async def _process_one(client: Client, message: Message, nyaa_id: str):
                     f"Uploading {label}: [{bar}] {percent}%\n"
                     f"{_format_bytes(current)} / {_format_bytes(total)} · {_format_bytes(speed)}/s"
                 )
-                try:
-                    await status_msg.edit_text(text)
-                except Exception as e:
-                    logger.warning("Upload status edit failed (%s) at %d%%: %s", label, percent, e)
-                finally:
-                    upload_last_edit["busy"] = False
+                _schedule_edit(upload_last_edit, status_msg, text)
 
-            sent = await client.send_document(
-                chat_id=backup_channel_id,
-                document=encoded_path,
-                caption=f"{title_line}\nQuality: {label}",
-                progress=on_upload_progress,
-            )
+            # The actual upload must not be silently dropped, so unlike the
+            # progress-bar edits above this one really is retried on FloodWait
+            # rather than skipped.
+            for attempt in range(4):
+                try:
+                    sent = await client.send_document(
+                        chat_id=backup_channel_id,
+                        document=encoded_path,
+                        caption=f"{title_line}\nQuality: {label}",
+                        progress=on_upload_progress,
+                    )
+                    break
+                except FloodWait as e:
+                    logger.warning(
+                        "send_document flood-waited %ss (%s, attempt %d)", e.value, label, attempt + 1
+                    )
+                    await asyncio.sleep(e.value)
+            else:
+                raise RuntimeError(f"send_document kept flood-waiting for {label}")
             last_message_link = f"https://t.me/c/{str(backup_channel_id)[4:]}/{sent.id}"
 
             # Free this variant's disk space as soon as it's uploaded rather than
@@ -244,14 +295,11 @@ async def _process_one(client: Client, message: Message, nyaa_id: str):
         if episode is not None:
             await db.update_last_uploaded_episode(batch["_id"], episode)
 
-        await status_msg.edit_text(f"{title_line}\n\nDone.")
+        await _safe_edit(status_msg, f"{title_line}\n\nDone.")
 
     except Exception as e:
         logger.exception("Failed processing %s", nyaa_id)
-        try:
-            await status_msg.edit_text(f"{title_line}\n\nFailed: {e}")
-        except Exception:
-            pass
+        await _safe_edit(status_msg, f"{title_line}\n\nFailed: {e}")
     finally:
         # Clean up the per-item download directory unconditionally. A failed/timed-out
         # download or encode can leave partial data behind under DOWNLOAD_DIR/<nyaa_id>/
