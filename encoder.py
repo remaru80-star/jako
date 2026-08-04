@@ -72,12 +72,19 @@ async def _run_ffmpeg(args: list[str]):
 
 
 async def _encode_variant(input_path: str, output_dir: str, file_stem: str, height: int,
-                           target_size_mb: float, duration: float, audio_streams: int) -> str:
-    """Two-pass H.264 + AAC 2.0 encode, scaled to `height`p, sized at ~target_size_mb."""
+                           target_size_mb: float, duration: float, audio_streams: int,
+                           extension: str) -> str:
+    """Two-pass H.264 + AAC 2.0 encode, scaled to `height`p, sized at ~target_size_mb.
+
+    Keeps the source file's container (`extension`) rather than forcing mp4, so
+    subtitle tracks (commonly ASS/SSA or PGS in anime releases) can be carried
+    over with `-c:s copy` — most subtitle codecs can't be copied into an mp4
+    container at all, which is why they were silently dropped before.
+    """
     video_kbps = _video_kbps_for_target(
         target_size_mb, duration, audio_streams, config.FFMPEG_AUDIO_BITRATE_KBPS,
     )
-    output_path = os.path.join(output_dir, f"{file_stem}.mp4")
+    output_path = os.path.join(output_dir, f"{file_stem}{extension}")
     passlog = os.path.join(output_dir, f"{file_stem}_2pass")
     scale_filter = f"scale=-2:{height}"
 
@@ -87,19 +94,22 @@ async def _encode_variant(input_path: str, output_dir: str, file_stem: str, heig
         "-c:v", "libx264", "-preset", config.FFMPEG_PRESET,
         "-b:v", f"{video_kbps}k", "-pix_fmt", "yuv420p",
         "-pass", "1", "-passlogfile", passlog,
-        "-an", "-f", "mp4", os.devnull,
+        "-an", "-f", "null", os.devnull,
     ]
     pass2 = [
         "-y", "-i", input_path,
-        "-map", "0:v:0", "-map", "0:a?",
+        "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?",
         "-vf", scale_filter,
         "-c:v", "libx264", "-preset", config.FFMPEG_PRESET,
         "-b:v", f"{video_kbps}k", "-pix_fmt", "yuv420p",
         "-pass", "2", "-passlogfile", passlog,
         "-c:a", "aac", "-b:a", f"{config.FFMPEG_AUDIO_BITRATE_KBPS}k", "-ac", "2",
-        "-movflags", "+faststart",
-        output_path,
+        "-c:s", "copy",
     ]
+    if extension.lower() in (".mp4", ".m4v", ".mov"):
+        pass2 += ["-movflags", "+faststart"]
+    pass2.append(output_path)
+
     await _run_ffmpeg(pass1)
     await _run_ffmpeg(pass2)
 
@@ -133,6 +143,10 @@ async def encode_all(input_path: str, output_dir: str, file_stem: str,
     duration = await probe_duration(input_path)
     src_height = await probe_video_height(input_path)
     audio_streams = await probe_audio_stream_count(input_path)
+    # Preserve the source container (e.g. .mkv) instead of forcing .mp4, so
+    # subtitle tracks can be copied through. Fall back to .mkv if the source
+    # has no extension, since it supports basically any subtitle codec.
+    extension = os.path.splitext(input_path)[1] or ".mkv"
 
     results = []
     for label, height, target_mb in _VARIANTS:
@@ -145,7 +159,7 @@ async def encode_all(input_path: str, output_dir: str, file_stem: str,
             await on_variant_start(label)
         output_path = await _encode_variant(
             input_path, output_dir, f"{file_stem}_{label}", height, target_mb,
-            duration, audio_streams,
+            duration, audio_streams, extension,
         )
         results.append((label, output_path))
         if on_variant_done:
